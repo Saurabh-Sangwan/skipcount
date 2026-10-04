@@ -100,280 +100,33 @@ h2{font-size:16px;margin:4px 0 11px}.sub{color:var(--muted);font-size:13px;line-
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/pose.js"></script>
 <script>
 const $=id=>document.getElementById(id),video=$('video'),canvas=$('canvas'),ctx=canvas.getContext('2d');
-
-let pose,stream,running=false,paused=false,counting=false;
-let jumps=0,startAt=0,elapsedBefore=0,lastJump=0,lastFrame=0;
-let baseline=null,baselineSamples=[],prevSignal=null,signalVelocity=0;
-let phase='ground',airStart=0,airPeak=0,lastAirTime=0;
-let recent=[],rpmHistory=[],lastVoice=0,goal=0,countdownTimer=null;
-let signalHistory=[],confidenceHistory=[];
-
+let pose,stream,running=false,paused=false,counting=false,jumps=0,startAt=0,elapsedBefore=0,lastCount=0;
+let calibrated=false,baseline=0,scaleBase=.15,buf=[],extrema=[],recent=[],rpmHistory=[],lastVoice=0,goal=0,countdownTimer=null;
 function elapsed(){return elapsedBefore+(running&&!paused?(performance.now()-startAt)/1000:0)}
 function fmt(s){s=Math.max(0,Math.floor(s));return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')}
-function say(t){if(!$('voice').checked)return;if(performance.now()-lastVoice<550)return;lastVoice=performance.now();speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(t))}
+function say(t){if(!$('voice').checked||performance.now()-lastVoice<600)return;lastVoice=performance.now();speechSynthesis.cancel();speechSynthesis.speak(new SpeechSynthesisUtterance(t))}
 function toast(t){$('toast').textContent=t;$('toast').classList.add('show');setTimeout(()=>$('toast').classList.remove('show'),1500)}
-function median(a){a=a.filter(Number.isFinite).sort((x,y)=>x-y);return a.length?a[Math.floor(a.length/2)]:null}
-function percentile(a,p){if(!a.length)return 0;const x=[...a].sort((u,v)=>u-v),i=(x.length-1)*p;const lo=Math.floor(i),hi=Math.ceil(i);return x[lo]+(x[hi]-x[lo])*(i-lo)}
+function avg(a){return a.length?a.reduce((x,y)=>x+y,0)/a.length:0}
 function fastest30(){return Math.round(recent.filter(t=>t>performance.now()-30000).length*2)}
-function consistency(){if(rpmHistory.length<3)return 0;const a=rpmHistory.reduce((x,y)=>x+y,0)/rpmHistory.length,d=rpmHistory.reduce((x,y)=>x+Math.abs(y-a),0)/rpmHistory.length;return Math.max(0,Math.min(100,Math.round(100*(1-d/Math.max(a,1)))))}
-
-function renderHistory(){
- const d=JSON.parse(localStorage.getItem('skipSessions')||'[]');
- $('history').innerHTML=d.length?d.map(x=>`<div style="padding:9px 0;border-bottom:1px solid #252c39"><b>${x.jumps.toLocaleString()} skips</b> · ${x.avg} RPM · ${fmt(x.time)}<br><span style="font-size:11px;color:#8993a4">${x.date} · fastest 30s ${x.fast} RPM · consistency ${x.cons}%</span></div>`).join(''):'No saved sessions yet.';
-}
-function saveSession(){
- if(jumps<1)return;
- const e=elapsed(),avg=e?Math.round(jumps/(e/60)):0,d=JSON.parse(localStorage.getItem('skipSessions')||'[]');
- d.unshift({date:new Date().toLocaleString(),jumps,time:e,avg,fast:fastest30(),cal:Math.round(10*(+$('weight').value)*e/3600),cons:consistency()});
- localStorage.setItem('skipSessions',JSON.stringify(d.slice(0,10)));renderHistory();
-}
-function update(){
- const e=elapsed();
- $('count').textContent=jumps;$('time').textContent=fmt(e);
- recent=recent.filter(t=>t>performance.now()-60000);$('rpm').textContent=recent.length;
- const kg=+$('weight').value;$('cal').textContent=Math.round(10*kg*e/3600);
- goal=+$('goal').value;$('bar').style.width=goal?Math.min(100,jumps/goal*100)+'%':'0%';
- $('target').textContent=goal?(jumps>=goal?'🎉 Target complete!':`${goal.toLocaleString()} skip target — ${Math.max(0,goal-jumps).toLocaleString()} remaining`):'Free workout — no target';
-}
+function consistency(){if(rpmHistory.length<3)return 0;const a=avg(rpmHistory),d=avg(rpmHistory.map(x=>Math.abs(x-a)));return Math.max(0,Math.min(100,Math.round(100*(1-d/Math.max(a,1)))))}
+function renderHistory(){const d=JSON.parse(localStorage.getItem('skipSessions')||'[]');$('history').innerHTML=d.length?d.map(x=>`<div style="padding:9px 0;border-bottom:1px solid #252c39"><b>${x.jumps.toLocaleString()} skips</b> · ${x.avg} RPM · ${fmt(x.time)}<br><span style="font-size:11px;color:#8993a4">${x.date} · fastest 30s ${x.fast} RPM · consistency ${x.cons}%</span></div>`).join(''):'No saved sessions yet.'}
+function saveSession(){if(!jumps)return;const e=elapsed(),a=e?Math.round(jumps/(e/60)):0,d=JSON.parse(localStorage.getItem('skipSessions')||'[]');d.unshift({date:new Date().toLocaleString(),jumps,time:e,avg:a,fast:fastest30(),cal:Math.round(10*(+$('weight').value)*e/3600),cons:consistency()});localStorage.setItem('skipSessions',JSON.stringify(d.slice(0,10)));renderHistory()}
+function update(){const e=elapsed();$('count').textContent=jumps;$('time').textContent=fmt(e);recent=recent.filter(t=>t>performance.now()-60000);$('rpm').textContent=recent.length;$('cal').textContent=Math.round(10*(+$('weight').value)*e/3600);goal=+$('goal').value;$('bar').style.width=goal?Math.min(100,jumps/goal*100)+'%':'0%';$('target').textContent=goal?(jumps>=goal?'🎉 Target complete!':`${goal.toLocaleString()} skip target — ${Math.max(0,goal-jumps).toLocaleString()} remaining`):'Free workout — no target'}
 setInterval(update,250);
-
-/* ---------------- Robust jump detector ----------------
-   Instead of relying on one landmark, we construct a normalized vertical
-   "jump signal" from hips + ankles. Normalization by torso height makes the
-   thresholds adapt to camera distance and body size.
-*/
-async function setup(){
- pose=new Pose({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/${f}`});
- pose.setOptions({
-   modelComplexity:1,smoothLandmarks:true,enableSegmentation:false,
-   minDetectionConfidence:.55,minTrackingConfidence:.60
- });
- pose.onResults(results);
-}
-
-function getSignal(lm){
- const needed=[23,24,25,26,27,28];
- const good=needed.map(i=>lm[i]).filter(p=>p&&p.visibility>.55);
- if(good.length<4)return null;
-
- const L=lm[23],R=lm[24],LA=lm[27],RA=lm[28];
- const hips=[L.y,R.y].filter(v=>Number.isFinite(v));
- const ankles=[LA.y,RA.y].filter(v=>Number.isFinite(v));
- const knees=[lm[25],lm[26]].filter(p=>p&&p.visibility>.5).map(p=>p.y);
- if(hips.length<2||ankles.length<2)return null;
-
- const hip=(hips[0]+hips[1])/2;
- const ankle=(ankles[0]+ankles[1])/2;
- const knee=median(knees);
- const torso=Math.max(.08,Math.abs(hip-knee||hip-ankle)*1.8);
-
- // Weighted center. Ankles carry most of the jump signal; hips stabilize it.
- const raw=.72*ankle+.28*hip;
- return {raw,hip,ankle,scale:torso};
-}
-
-function calibrate(sig){
- baselineSamples.push(sig.raw);
- if(baselineSamples.length>45)baselineSamples.shift();
- if(baselineSamples.length>=25){
-   baseline=percentile(baselineSamples,.50);
-   $('status').textContent='Calibrated — start jumping';
-   return true;
- }
- $('status').textContent=`Calibrating ${Math.round(baselineSamples.length/25*100)}%`;
- return false;
-}
-
-function detectJump(sig,now){
- if(!baseline||prevSignal===null){prevSignal=sig.raw;return}
- // Low-pass already supplied by MediaPipe; this extra smoothing suppresses
- // individual landmark jitter without making the detector sluggish.
- const alpha=.42;
- const smooth=prevSignal+alpha*(sig.raw-prevSignal);
- signalVelocity=(smooth-prevSignal)*60; // normalized change/sec
- prevSignal=smooth;
-
- signalHistory.push({t:now,y:smooth,v:signalVelocity});
- if(signalHistory.length>90)signalHistory.shift();
-
- // Slowly adapt ground level while the athlete is not airborne.
- if(phase==='ground'){
-   baseline=baseline*.997+smooth*.003;
- }
-
- const scale=Math.max(.06,sig.scale);
- const displacement=smooth-baseline;
- const normDisp=displacement/scale;
-
- // In camera coordinates: positive = downward.
- // A jump starts when the ankle/hip center moves clearly upward.
- const up=-0.10, down=.075;
-
- if(phase==='ground'){
-   if(normDisp<up && signalVelocity<-.07){
-     phase='air';
-     airStart=now;
-     airPeak=normDisp;
-     lastAirTime=now;
-   }
- }else{
-   airPeak=Math.min(airPeak,normDisp);
-
-   // Return toward ground. Require meaningful upward displacement,
-   // reasonable flight duration, and cadence debounce.
-   if(normDisp>down && signalVelocity>.035){
-     const flight=now-airStart;
-     const amplitude=Math.abs(airPeak);
-     const sinceLast=now-lastJump;
-
-     // Normal rope skipping generally falls in this range. This rejects
-     // rapid camera noise and ordinary knee/ankle twitches.
-     if(flight>=110 && flight<=1100 && amplitude>=.13 && sinceLast>=230){
-       registerJump(now,flight,amplitude);
-     }
-     phase='ground';
-     airStart=0;airPeak=0;
-   }
-
-   // Recover if pose was interpreted as airborne for too long.
-   if(now-airStart>1400){phase='ground';airStart=0;airPeak=0}
- }
-}
-
-function registerJump(now,flight,amplitude){
- jumps++;lastJump=now;recent.push(now);
- $('status').textContent='Skip ✓';
- if($('vibrate').checked&&navigator.vibrate)navigator.vibrate(12);
-
- // Keep an approximate cadence sample every 10 jumps.
- if(jumps%10===0){
-   const rpm=Math.round(recent.filter(t=>t>now-60000).length);
-   if(rpm>20&&rpm<260)rpmHistory.push(rpm);
- }
- if(jumps%100===0){
-   say(`${jumps} skips`);
-   toast(`${jumps.toLocaleString()} skips 🎉`);
- }
- if(goal&&jumps>=goal)finishWorkout();
-}
-
-function results(r){
- if(!running||paused||!counting)return;
- canvas.width=video.videoWidth;canvas.height=video.videoHeight;ctx.clearRect(0,0,canvas.width,canvas.height);
-
- const lm=r.poseLandmarks;
- if(!lm){
-   $('status').textContent='Pose lost — step back into frame';
-   // Don't reset the detector immediately; brief occlusion is common.
-   return;
- }
- const sig=getSignal(lm);
- if(!sig){
-   $('status').textContent='Keep both legs visible';
-   return;
- }
-
- // Draw landmarks.
- ctx.save();ctx.scale(-1,1);ctx.translate(-canvas.width,0);ctx.fillStyle='#8b6cff';
- lm.forEach(p=>{if(p.visibility>.5){ctx.beginPath();ctx.arc(p.x*canvas.width,p.y*canvas.height,4,0,Math.PI*2);ctx.fill()}});
- ctx.restore();
-
- if(!baseline) { if(calibrate(sig)){prevSignal=sig.raw} return; }
-
- confidenceHistory.push(Math.min(1,Math.max(0,sig.scale/.15)));
- if(confidenceHistory.length>30)confidenceHistory.shift();
- detectJump(sig,performance.now());
-}
-
-async function startWorkout(){
- if(!pose)await setup();
- try{
-  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:720},height:{ideal:1280},frameRate:{ideal:30,max:30}},audio:false});
-  video.srcObject=stream;await video.play();
-
-  running=true;paused=false;counting=false;jumps=0;recent=[];rpmHistory=[];
-  baseline=null;baselineSamples=[];prevSignal=null;signalHistory=[];confidenceHistory=[];
-  phase='ground';airStart=0;airPeak=0;lastJump=0;elapsedBefore=0;
-
-  $('start').disabled=true;$('pause').disabled=false;$('status').textContent='Camera ready';
-  loop();
-
-  const n=+$('countdown').value;
-  if(n)await countdown(n);else beginCounting();
- }catch(e){
-  $('status').textContent='Camera permission unavailable';
-  toast('Allow camera access and reload');
- }
-}
-
-function countdown(n){
- return new Promise(resolve=>{
-  const o=$('countdownOverlay');o.style.display='flex';let x=n;o.textContent=x;say('Get ready');
-  countdownTimer=setInterval(()=>{
-    x--;
-    if(x<=0){clearInterval(countdownTimer);o.style.display='none';beginCounting();resolve()}
-    else{o.textContent=x;say(String(x))}
-  },1000);
- });
-}
-
-function beginCounting(){
- counting=true;startAt=performance.now();
- $('status').textContent='Calibrating — stand still';
- say('Stand still');
-}
-
-async function loop(){
- if(!running)return;
- if(!paused&&video.readyState>=2)await pose.send({image:video});
- requestAnimationFrame(loop);
-}
-
-function finishWorkout(){
- if(!running)return;
- counting=false;paused=true;
- elapsedBefore+=(performance.now()-startAt)/1000;
- const e=elapsed(),avg=e?Math.round(jumps/(e/60)):0;
- $('sumJumps').textContent=jumps.toLocaleString();
- $('sumRpm').textContent=avg;
- $('sumFast').textContent=fastest30();
- $('sumTime').textContent=fmt(e);
- $('sumCal').textContent=Math.round(10*(+$('weight').value)*e/3600);
- $('sumConsistency').textContent=consistency()+'%';
- $('summaryCard').style.display='block';
- $('status').textContent='Workout complete 🎉';
- $('pause').disabled=true;
- say('Workout complete');
- saveSession();
-}
-
-$('pause').onclick=()=>{
- if(!running||!counting)return;
- if(!paused){
-   elapsedBefore+=(performance.now()-startAt)/1000;paused=true;
-   $('pause').textContent='Resume';$('status').textContent='Paused';
- }else{
-   startAt=performance.now();paused=false;
-   $('pause').textContent='Pause';$('status').textContent='Counting…';
- }
-};
-
-$('reset').onclick=()=>{
- if(countdownTimer)clearInterval(countdownTimer);
- if(running&&jumps>0)saveSession();
- jumps=0;recent=[];baseline=null;baselineSamples=[];prevSignal=null;
- signalHistory=[];confidenceHistory=[];rpmHistory=[];elapsedBefore=0;
- phase='ground';airStart=0;airPeak=0;lastJump=0;counting=false;paused=false;running=false;
- $('countdownOverlay').style.display='none';$('start').disabled=false;$('pause').disabled=true;
- $('status').textContent='Camera not started';
- if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}
- update();
-};
-
-$('start').onclick=startWorkout;
-$('goal').onchange=update;
-$('weight').onchange=update;
-renderHistory();update();
+async function setup(){pose=new Pose({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/${f}`});pose.setOptions({modelComplexity:1,smoothLandmarks:true,enableSegmentation:false,minDetectionConfidence:.5,minTrackingConfidence:.55});pose.onResults(results)}
+function metrics(lm){const req=[11,12,23,24,27,28];if(req.filter(i=>lm[i]&&lm[i].visibility>.55).length<6)return null;const sh=(lm[11].y+lm[12].y)/2,hip=(lm[23].y+lm[24].y)/2,ank=(lm[27].y+lm[28].y)/2;const torso=Math.max(.05,Math.abs(sh-hip)),leg=Math.max(.08,Math.abs(ank-hip));return{signal:-(.62*hip+.38*ank),scale:Math.max(.06,.6*torso+.4*leg)}}
+function calibrate(m){buf.push(m.signal);if(buf.length>75)buf.shift();if(buf.length<30){$('status').textContent=`Calibrating… ${Math.round(buf.length/30*100)}%`;return}baseline=avg(buf);scaleBase=m.scale;calibrated=true;$('status').textContent='Calibrated — start skipping';say('Go')}
+function register(t,dt){jumps++;lastCount=t;recent.push(t);const rpm=Math.round(60000/dt);if(rpm>=45&&rpm<=240)rpmHistory.push(rpm);$('status').textContent=`Skip ✓  ${rpm} RPM`;if($('vibrate').checked&&navigator.vibrate)navigator.vibrate(10);if(jumps%100===0){say(`${jumps} skips`);toast(`${jumps.toLocaleString()} skips 🎉`)}if(goal&&jumps>=goal)finishWorkout()}
+function detect(m,now){const norm=(m.signal-baseline)/(.65*scaleBase+.35*m.scale);buf.push(norm);if(buf.length>45)buf.shift();const smooth=avg(buf.slice(-5));extrema.push({t:now,y:smooth});if(extrema.length>45)extrema.shift();if(extrema.length<9)return;const a=extrema.slice(-7),c=a[3],left=a.slice(0,3),right=a.slice(4);const trough=c.y<Math.min(...left.map(x=>x.y))&&c.y<=Math.min(...right.map(x=>x.y));if(!trough)return;const prior=extrema.filter(x=>x.t<c.t-180).slice(-1)[0];if(!prior)return;const dt=c.t-prior.t,amp=Math.abs(c.y-prior.y);if(dt>=270&&dt<=1200&&amp>.025&&c.t-lastCount>240)register(c.t,dt);if(Math.abs(smooth)<.06)baseline=baseline*.998+m.signal*.002}
+function results(r){if(!running||paused||!counting)return;canvas.width=video.videoWidth;canvas.height=video.videoHeight;ctx.clearRect(0,0,canvas.width,canvas.height);if(!r.poseLandmarks){$('status').textContent='Pose lost — step back';return}const m=metrics(r.poseLandmarks);if(!m){$('status').textContent='Keep your full body visible';return}ctx.save();ctx.scale(-1,1);ctx.translate(-canvas.width,0);ctx.fillStyle='#8b6cff';r.poseLandmarks.forEach(p=>{if(p.visibility>.5){ctx.beginPath();ctx.arc(p.x*canvas.width,p.y*canvas.height,4,0,Math.PI*2);ctx.fill()}});ctx.restore();if(!calibrated){calibrate(m);return}detect(m,performance.now())}
+async function startWorkout(){if(!pose)await setup();try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:720},height:{ideal:1280},frameRate:{ideal:30,max:30}},audio:false});video.srcObject=stream;await video.play();running=true;paused=false;counting=false;jumps=0;recent=[];rpmHistory=[];buf=[];extrema=[];calibrated=false;lastCount=0;elapsedBefore=0;$('start').disabled=true;$('pause').disabled=false;$('status').textContent='Camera ready';loop();const n=+$('countdown').value;if(n)countdown(n);else beginCounting()}catch(e){$('status').textContent='Camera permission unavailable';toast('Allow camera access and reload')}}
+function countdown(n){const o=$('countdownOverlay');o.style.display='flex';let x=n;o.textContent=x;say('Get ready');countdownTimer=setInterval(()=>{x--;if(x<=0){clearInterval(countdownTimer);o.style.display='none';beginCounting()}else{o.textContent=x;say(String(x))}},1000)}
+function beginCounting(){counting=true;startAt=performance.now();$('status').textContent='Stand still for calibration';}
+async function loop(){if(!running)return;if(!paused&&video.readyState>=2)await pose.send({image:video});requestAnimationFrame(loop)}
+function finishWorkout(){if(!running)return;counting=false;paused=true;elapsedBefore+=(performance.now()-startAt)/1000;const e=elapsed(),a=e?Math.round(jumps/(e/60)):0;$('sumJumps').textContent=jumps.toLocaleString();$('sumRpm').textContent=a;$('sumFast').textContent=fastest30();$('sumTime').textContent=fmt(e);$('sumCal').textContent=Math.round(10*(+$('weight').value)*e/3600);$('sumConsistency').textContent=consistency()+'%';$('summaryCard').style.display='block';$('status').textContent='Workout complete 🎉';$('pause').disabled=true;say('Workout complete');saveSession()}
+$('pause').onclick=()=>{if(!running||!counting)return;if(!paused){elapsedBefore+=(performance.now()-startAt)/1000;paused=true;$('pause').textContent='Resume';$('status').textContent='Paused'}else{startAt=performance.now();paused=false;$('pause').textContent='Pause';$('status').textContent='Counting…'}};
+$('reset').onclick=()=>{if(countdownTimer)clearInterval(countdownTimer);if(running&&jumps>0)saveSession();jumps=0;recent=[];rpmHistory=[];buf=[];extrema=[];calibrated=false;baseline=0;lastCount=0;elapsedBefore=0;counting=false;paused=false;running=false;$('countdownOverlay').style.display='none';$('start').disabled=false;$('pause').disabled=true;$('status').textContent='Camera not started';if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}update()};
+$('start').onclick=startWorkout;$('goal').onchange=update;$('weight').onchange=update;renderHistory();update();
 window.addEventListener('beforeunload',()=>stream&&stream.getTracks().forEach(t=>t.stop()));
 </script>
 <script>
